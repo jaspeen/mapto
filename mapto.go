@@ -1,17 +1,21 @@
 package mapto
 
 import (
+	"encoding/json"
+	"errors"
 	"github.com/mitchellh/mapstructure"
 	"reflect"
-	"errors"
 	"time"
-	"encoding/json"
+	"regexp"
+	"fmt"
 )
-// methods what enum types(ints..) need to implement to allow converting from/to string
+
+// Enum simulation. Methods what golang enum types(ints..) need to implement to allow converting from/to string
 type Enum interface {
 	FromString(val string) bool
 	String() string
 }
+
 // helper funcs to easy implement json unmarshal for enum types
 func EnumUnmarshalJSON(e Enum, b []byte) error {
 	var s string
@@ -25,50 +29,70 @@ func EnumUnmarshalJSON(e Enum, b []byte) error {
 	return nil
 }
 
+// Mark structs what should init their fields to some defaults other than zero-values before mapping
+type Initializable interface {
+	Init() error
+}
 
 // Struct constructors
 type Constructor func(Type reflect.Type, val interface{}) (interface{}, bool, error)
+
+// Global type qualifier to contructor dictionary
 var typeConstructors = map[string]Constructor{}
 
-// Simple struct constructor what create specified struct type and then fill fields from raw map
+// Simple struct constructor what create specified struct type and then fill fields from raw map and optionally cal Init method
 func StructConstructor(structType interface{}) Constructor {
 	st := reflect.TypeOf(structType)
 	return func(Type reflect.Type, val interface{}) (interface{}, bool, error) {
 		if st.AssignableTo(Type) {
 			v, b := reflect.New(st.Elem()).Interface(), true
+			initializablev, ok := v.(Initializable)
+			if ok {
+				err := initializablev.Init()
+				if err != nil {
+					return nil, false, err
+				}
+			}
 			return v, b, nil
 		}
 		return val, false, nil
 	}
 }
 
-func RegisterConstructor(classifier string, constructor Constructor) {
-	typeConstructors[classifier] = constructor
+// Register type qualifier
+func RegisterConstructor(qualifier string, constructor Constructor) {
+	typeConstructors[qualifier] = constructor
 }
 
-func getConstructor(classifier string) (Constructor, bool) {
-	c, ok := typeConstructors[classifier]
+func GetConstructor(qualifier string) (Constructor, bool) {
+	c, ok := typeConstructors[qualifier]
 	return c, ok
 }
 
 var durationType = reflect.TypeOf(time.Hour)
 var enumType = reflect.TypeOf((*Enum)(nil)).Elem()
+var regexpType = reflect.TypeOf(&regexp.Regexp{})
 
 func decodeHook(a reflect.Type, b reflect.Type, c interface{}) (interface{}, error) {
 	obj, ok := c.(map[string]interface{})
 
 	if ok {
-		classifierIface, ok := obj["@type"]
+		qualifierIface, ok := obj["@type"]
 		if ok {
-			classifier, ok := classifierIface.(string)
+			qualifier, ok := qualifierIface.(string)
 			if ok {
-				constr, ok := getConstructor(classifier)
+				constr, ok := GetConstructor(qualifier)
 				if ok {
 					res, fill, err := constr(b, c)
 
 					if err != nil {
 						return nil, err
 					}
+					resType := reflect.TypeOf(res)
+					if !resType.AssignableTo(b) {
+						return nil, errors.New(fmt.Sprintf("Type '%s' from qualifier '%s' not assignable to '%s'", resType.String(), qualifier, b.String()));
+					}
+
 					if fill {
 						delete(obj, "@type")
 						err = Decode(c, res)
@@ -78,7 +102,7 @@ func decodeHook(a reflect.Type, b reflect.Type, c interface{}) (interface{}, err
 					}
 					return res, nil
 				} else {
-					return nil, errors.New("No constructor for classifier " + classifier)
+					return nil, errors.New("No constructor for qualifier " + qualifier)
 				}
 			}
 		}
@@ -96,6 +120,8 @@ func decodeHook(a reflect.Type, b reflect.Type, c interface{}) (interface{}, err
 
 				return reflect.ValueOf(e).Elem().Interface(), nil
 			}
+		} else if b.AssignableTo(regexpType) {
+			return regexp.Compile(str)
 		}
 	}
 	return c, nil
